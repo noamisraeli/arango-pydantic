@@ -1,62 +1,117 @@
-from datetime import datetime
-from typing import List
-from arango import ArangoClient
-from pydantic_graphs.arango.wrappers import ArangoGraphManager
+import asyncio
+from uuid import uuid4
 
-from pydantic_graphs.core import Node, Edge
+from aioarangodb import ArangoClient
+from pydantic import BaseModel
+from shylock import AsyncLock as Lock
+from shylock import ShylockAioArangoDBBackend
+from shylock import configure as configure_shylock
 
-from arango import ArangoClient
-from arango.graph import Graph
-from arango.database import StandardDatabase
+from arangodantic import ASCENDING, DocumentModel, EdgeModel, configure
 
-class Task(Node):
+
+# Define models
+class Owner(BaseModel):
+    """Dummy owner Pydantic model."""
+
+    first_name: str
+    last_name: str
+
+
+class Company(DocumentModel):
+    """Dummy company Arangodantic model."""
+
+    company_id: str
+    owner: Owner
+
+
+class Link(EdgeModel):
+    """Dummy Link Arangodantic model."""
+
     type: str
 
-class Worker(Node):
-    name: str
-    description: str
 
+async def main():
+    # Configure the database settings
+    hosts = "http://localhost:8529"
+    username = "root"
+    password = "openSesame"
+    database = "example"
+    prefix = "example-"
 
-class Execute(Edge):
-    estimated_duration: datetime
+    client = ArangoClient(hosts=hosts)
+    # Connect to "_system" database and create the actual database if it doesn't exist
+    # Only for demo, you likely want to create the database in advance.
+    sys_db = await client.db("_system", username=username, password=password)
+    if not await sys_db.has_database(database):
+        await sys_db.create_database(database)
 
-def get_or_create_graph(db_api: StandardDatabase, grahp_name: str) -> Graph:
-    if not db_api.has_graph(grahp_name):
-        return db_api.create_graph(grahp_name)
-    else:
-        return db_api.graph(grahp_name)
+    # Configure Arangodantic and Shylock
+    db = await client.db(database, username=username, password=password)
+    configure_shylock(await ShylockAioArangoDBBackend.create(db, f"{prefix}shylock"))
+    configure(db, prefix=prefix, key_gen=uuid4, lock=Lock)
 
+    # Create collections if they don't yet exist
+    # Only for demo, you likely want to create the collections in advance.
+    await Company.ensure_collection()
+    await Link.ensure_collection()
 
-if __name__ == '__main__':
+    # Let's create some example entries
+    owner = Owner(first_name="John", last_name="Doe")
+    company = Company(company_id="1234567-8", owner=owner)
+    await company.save()
+    print(f"Company saved with key: {company.key_}")
 
-    # Initialize the ArangoDB client.
+    second_owner = Owner(first_name="Jane", last_name="Doe")
+    second_company = Company(company_id="2345678-9", owner=second_owner)
+    await second_company.save()
+    print(f"Second company saved with key: {second_company.key_}")
 
+    link = Link(_from=company, _to=second_company, type="CustomerOf")
+    await link.save()
+    print(f"Link saved with key: {link.key_}")
 
-    # Initialize the client for ArangoDB.
-    client = ArangoClient(
-        hosts="http://localhost:8529"
+    # Hold named locks while loading and doing changes
+    async with Company.lock_and_load(company.key_) as c:
+        assert c.owner == owner
+        c.owner.first_name = "Joanne"
+        await c.save()
+
+    await company.reload()
+    print(f"Updated owner of company to '{company.owner!r}'")
+
+    # Let's explore the find functionality
+    # Note: You likely want to add indexes to support the queries
+    print("Finding companies owned by a person with last name 'Doe'")
+    async with (await Company.find({"owner.last_name": "Doe"}, count=True)) as cursor:
+        print(f"Found {len(cursor)} companies")
+        async for found_company in cursor:
+            print(f"Company: {found_company.company_id}")
+
+    # Supported operators include: "==", "!=", "<", "<=", ">", ">="
+    found_company = await Company.find_one(
+        {"owner.last_name": "Doe", "_id": {"!=": company}}
     )
+    print(f"Found the company {found_company.key_}")
 
-    sys_db = client.db("_system", username="root", password="openSesame")
+    # Find also supports sorting and the cursor can easily be converted to a list
+    companies = await (
+        await Company.find(
+            sort=[
+                ("owner.last_name", ASCENDING),
+                ("owner.first_name", ASCENDING),
+            ]
+        )
+    ).to_list()
+    print("Companies sorted by owner:")
+    for c in companies:
+        print(f"Company {c.company_id}, owner: {c.owner!r}")
 
-    # Connect to "test" database as root user.
-    db = client.db("test", username="root", password="openSesame")
 
-   
-    graph = get_or_create_graph(db, 'planit_ui')
+if __name__ == "__main__":
+    # Starting from Python 3.7 ->
+    asyncio.run(main())
 
-
-    manager = ArangoGraphManager(graph)
-    
-
-    manager.init_graph({Task, Worker}, {Execute})
-
-    building = Task(id='123', type='building', attributes=[])
-    manager.add_node(building)
-    manager.add_node(Task(id='143', type='sleep', attributes=[]))
-    yael = Worker(id='123', name='Yael', description='Researcher')
-    noam = Worker(id='345', name='Noam', description='Researcher')
-    manager.add_node(yael)
-    manager.add_node(noam)
-    manager.add_node(Worker(id='456', name='Yael', description='Researcher'))
-    manager.add_edge(Execute(source=yael, destination=building))
+    # # Compatible with Python 3.6 ->
+    # loop = asyncio.get_event_loop()
+    # result = loop.run_until_complete(main())

@@ -1,0 +1,10 @@
+{
+    "cSpell.ignoreWords": [
+        "pydantic"
+    ],
+    "cSpell.words": [
+        "aioarangodb",
+        "Arango",
+        "arangodantic"
+    ]
+}
